@@ -24,4 +24,4 @@ Built as the data ingestion component of a larger Twitch analytics platform, Cha
 - **Language:** Python 3.11+
 - **Chat:** TwitchIO
 - **Database:** PostgreSQL (via asyncpg)
-- **Hosting:** Designed to run on a VPS or any always-on machine
+- **Hosting:** Designed to run on a VPS or any always-on machine, utilizing Docker Containerization.
