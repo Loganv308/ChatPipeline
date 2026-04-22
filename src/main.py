@@ -7,14 +7,11 @@ from twitchio.ext import commands
 from twitchio import Message
 from dotenv import load_dotenv
 import os
-import twitchio
 
 load_dotenv()
 
-CHANNELS  = ["xqc", "paymoneywubby", "zackrawrr", "moonmoon", "summit1g"]
 TOKEN     = os.getenv("TWITCH_TOKEN")
 CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
-DSN       = os.getenv("SUPABASE_DSN")
 
 # Known bots to filter out
 BOT_NAMES = {"streamelements", "nightbot", "fossabot", "moobot", "streamlabs"}
@@ -52,11 +49,11 @@ def extract_message(msg: Message, channel_id_map: dict, active_streams: dict) ->
         "message_id": message_id,
         "channel":    channel_name,
         "channel_id": channel_id,
-        "stream_id":  active_streams.get(channel_name),  # None if offline
+        "stream_id":  active_streams.get(channel_name),
         "user_id":    str(msg.author.id) if msg.author.id else None,
         "username":   username,
         "message":    sanitize_message(msg.content),
-        "timestamp":  datetime.now(timezone.utc),
+        "timestamp":  msg.timestamp or datetime.now(timezone.utc),
         "subscriber": msg.author.is_subscriber,
         "is_bot":     username in BOT_NAMES,
     }, None
@@ -64,8 +61,7 @@ def extract_message(msg: Message, channel_id_map: dict, active_streams: dict) ->
 # ─── Bot ───────────────────────────────────────────────────────────────────
 
 class ScraperBot(commands.Bot):
-    def __init__(self, db_pool: asyncpg.Pool, channel_id_map: dict[str, int]):
-        # ✅ Initialize attributes BEFORE super().__init__()
+    def __init__(self, db_pool: asyncpg.Pool, channel_id_map: dict[str, int], channels: list[str]):
         self.db             = db_pool
         self.channel_id_map = channel_id_map
         self.queue: list[dict] = []
@@ -77,16 +73,17 @@ class ScraperBot(commands.Bot):
         }
         self.skip_queue: list[dict] = []
         self.active_streams: dict[str, str] = {}
+        self.channels = channels
 
         super().__init__(
             token=TOKEN,
             prefix="!",
-            initial_channels=CHANNELS,
+            initial_channels=channels,      # ← from DB, not hardcoded
             client_id=CLIENT_ID,
             client_secret=os.getenv("TWITCH_CLIENT_SECRET"),
-            bot_id="209765518",
+            bot_id=os.getenv("TWITCH_BOT_ID"),
         )
-        
+
     async def flush_skip_queue(self) -> None:
         while True:
             await asyncio.sleep(2)
@@ -118,9 +115,9 @@ class ScraperBot(commands.Bot):
             except Exception as e:
                 print(f"Skip queue flush error: {e}")
                 self.skip_queue = batch + self.skip_queue
-        
+
     async def event_ready(self) -> None:
-        print(f"Scraper ready | Watching: {', '.join(CHANNELS)}")
+        print(f"Scraper ready | Watching: {', '.join(self.channels)}")
 
     async def event_message(self, message) -> None:
         if message.echo:
@@ -133,13 +130,13 @@ class ScraperBot(commands.Bot):
         if skip_reason:
             self.stats["skipped"] += 1
             self.skip_queue.append({
-                "reason":      skip_reason,
-                "message_id":  message.id,
+                "reason":       skip_reason,
+                "message_id":   message.id,
                 "channel_name": message.channel.name.lower() if message.channel else None,
-                "username":    message.author.name.lower() if message.author else None,
-                "content":     sanitize_message(message.content) if message.content else None,
-                "raw_tags":    str(message.tags) if message.tags else None,
-                "timestamp":   datetime.now(timezone.utc),
+                "username":     message.author.name.lower() if message.author else None,
+                "content":      sanitize_message(message.content) if message.content else None,
+                "raw_tags":     str(message.tags) if message.tags else None,
+                "timestamp":    datetime.now(timezone.utc),
             })
             return
 
@@ -147,12 +144,10 @@ class ScraperBot(commands.Bot):
         await self.handle_commands(message)
 
     async def event_command_error(self, ctx, error) -> None:
-        # Silently ignore unknown commands (e.g. "!discord" in chat)
         if isinstance(error, commands.CommandNotFound):
             return
         raise error
 
-    # ── Load: flush queue to Supabase every 2 seconds ────────────────────
     async def flush_queue(self) -> None:
         while True:
             await asyncio.sleep(2)
@@ -189,26 +184,29 @@ class ScraperBot(commands.Bot):
             except Exception as e:
                 self.stats["errors"] += 1
                 print(f"DB flush error: {e}")
-                # Return messages to queue so they aren't lost
                 self.queue = batch + self.queue
 
-    # ── Log stats every 60 seconds ────────────────────────────────────────
     async def log_stats(self) -> None:
         while True:
             await asyncio.sleep(60)
+            row = await self.db.fetchrow(
+                "SELECT pg_database_size(current_database()) AS size_bytes"
+            )
+            size_mb = row["size_bytes"] / (1024 * 1024)
             print(
                 f"[Stats] received={self.stats['received']} "
                 f"inserted={self.stats['inserted']} "
                 f"skipped={self.stats['skipped']} "
                 f"errors={self.stats['errors']} "
-                f"queue={len(self.queue)}"
+                f"queue={len(self.queue)} "
+                f"db={size_mb:.1f}MB"
             )
+
     async def poll_streams(self) -> None:
         while True:
             try:
-                streams = await self.fetch_streams(user_logins=CHANNELS)
+                streams = await self.fetch_streams(user_logins=self.channels)
 
-                # Reset active streams each poll so offline channels are cleared
                 self.active_streams = {}
 
                 if not streams:
@@ -222,7 +220,7 @@ class ScraperBot(commands.Bot):
                     if channel_id is None:
                         continue
 
-                    self.active_streams[channel_name] = stream.id  # ← track it
+                    self.active_streams[channel_name] = stream.id
 
                     rows.append((
                         stream.id,
@@ -252,20 +250,29 @@ class ScraperBot(commands.Bot):
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    print("Connecting to Supabase...")
-    db = await asyncpg.create_pool(DSN, min_size=2, max_size=5, ssl="require", statement_cache_size=0)
-    print("Connected to Supabase.")
+    print("Connecting to PostgreSQL...")
+    db = await asyncpg.create_pool(
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", "5432")),
+        database=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        min_size=2,
+        max_size=5,
+        statement_cache_size=0,
+    )
+    print("Connected to PostgreSQL.")
 
-    # Load channel name → id map from DB
     rows = await db.fetch("SELECT id, name FROM channels")
     channel_id_map = {row["name"]: row["id"] for row in rows}
+    channels       = list(channel_id_map.keys())
     print(f"Loaded channels: {channel_id_map}")
 
     if not channel_id_map:
-        print("No channels found in DB. Make sure you ran the setup SQL.")
+        print("No channels found in DB. Add rows to the channels table first.")
         return
 
-    bot = ScraperBot(db, channel_id_map)
+    bot = ScraperBot(db, channel_id_map, channels)
 
     await asyncio.gather(
         bot.start(),
