@@ -8,3 +8,5 @@ services:
       options:
         max-size: "10m"   # rotate logs at 10MB
         max-file: "3"     # keep last 3 log files
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
