@@ -2,10 +2,12 @@ import asyncio
 import asyncpg
 import re
 import html
+from LogStream.logstream import LogStream
 from datetime import datetime, timezone
 from twitchio.ext import commands
 from twitchio import Message
 from dotenv import load_dotenv
+
 import os
 
 load_dotenv()
@@ -15,6 +17,9 @@ CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 
 # Known bots to filter out
 BOT_NAMES = {"streamelements", "nightbot", "fossabot", "moobot", "streamlabs"}
+
+# Back-end Logging platform
+log = LogStream(service="ChatPipeline", host="http://192.168.1.97:3000")
 
 # ─── ETL: Transform / Sanitize ─────────────────────────────────────────────
 
@@ -113,7 +118,7 @@ class ScraperBot(commands.Bot):
                 ])
 
             except Exception as e:
-                print(f"Skip queue flush error: {e}")
+                log.error(f"Skip queue flush error: {e}")
                 self.skip_queue = batch + self.skip_queue
 
     async def event_ready(self) -> None:
@@ -183,7 +188,7 @@ class ScraperBot(commands.Bot):
 
             except Exception as e:
                 self.stats["errors"] += 1
-                print(f"DB flush error: {e}")
+                log.error(f"DB flush error: {e}")
                 self.queue = batch + self.queue
 
     async def log_stats(self) -> None:
@@ -193,7 +198,7 @@ class ScraperBot(commands.Bot):
                 "SELECT pg_database_size(current_database()) AS size_bytes"
             )
             size_mb = row["size_bytes"] / (1024 * 1024)
-            print(
+            log.info(
                 f"[Stats] received={self.stats['received']} "
                 f"inserted={self.stats['inserted']} "
                 f"skipped={self.stats['skipped']} "
@@ -240,10 +245,10 @@ class ScraperBot(commands.Bot):
                         peak_viewers = GREATEST(streams.peak_viewers, EXCLUDED.peak_viewers)
                 """, rows)
 
-                print(f"[Streams] Updated {len(rows)} stream(s)")
+                log.info(f"[Streams] Updated {len(rows)} stream(s)")
 
             except Exception as e:
-                print(f"[Streams] Poll error: {e}")
+                log.error(f"[Streams] Poll error: {e}")
 
             await asyncio.sleep(60)
 
@@ -269,7 +274,7 @@ async def main() -> None:
     print(f"Loaded channels: {channel_id_map}")
 
     if not channel_id_map:
-        print("No channels found in DB. Add rows to the channels table first.")
+        log.error("No channels found in DB. Add rows to the channels table first.")
         return
 
     bot = ScraperBot(db, channel_id_map, channels)
