@@ -122,7 +122,7 @@ class ScraperBot(commands.Bot):
                 self.skip_queue = batch + self.skip_queue
 
     async def event_ready(self) -> None:
-        print(f"Scraper ready | Watching: {', '.join(self.channels)}")
+        log.info(f"Scraper ready | Watching: {', '.join(self.channels)}")
 
     async def event_message(self, message) -> None:
         if message.echo:
@@ -255,7 +255,7 @@ class ScraperBot(commands.Bot):
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    print("Connecting to PostgreSQL...")
+    log.info("Connecting to PostgreSQL...")
     db = await asyncpg.create_pool(
         host=os.getenv("DB_HOST"),
         port=int(os.getenv("DB_PORT", "5432")),
@@ -266,12 +266,12 @@ async def main() -> None:
         max_size=5,
         statement_cache_size=0,
     )
-    print("Connected to PostgreSQL.")
+    log.info("Connected to PostgreSQL.")
 
     rows = await db.fetch("SELECT id, name FROM channels")
     channel_id_map = {row["name"]: row["id"] for row in rows}
     channels       = list(channel_id_map.keys())
-    print(f"Loaded channels: {channel_id_map}")
+    log.info(f"Loaded channels: {channel_id_map}")
 
     if not channel_id_map:
         log.error("No channels found in DB. Add rows to the channels table first.")
