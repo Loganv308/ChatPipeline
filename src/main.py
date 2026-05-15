@@ -212,19 +212,18 @@ class ScraperBot(commands.Bot):
             try:
                 streams = await self.fetch_streams(user_logins=self.channels)
 
+                # Build a set of currently live channel names
+                live_channel_names = set()
                 self.active_streams = {}
-
-                if not streams:
-                    await asyncio.sleep(60)
-                    continue
-
                 rows = []
+
                 for stream in streams:
                     channel_name = stream.user.name.lower()
                     channel_id   = self.channel_id_map.get(channel_name)
                     if channel_id is None:
                         continue
 
+                    live_channel_names.add(channel_name)
                     self.active_streams[channel_name] = stream.id
 
                     rows.append((
@@ -236,16 +235,28 @@ class ScraperBot(commands.Bot):
                         stream.viewer_count,
                     ))
 
-                await self.db.executemany("""
-                    INSERT INTO streams (id, channel_id, title, game_name, started_at, peak_viewers)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (id) DO UPDATE SET
-                        title        = EXCLUDED.title,
-                        game_name    = EXCLUDED.game_name,
-                        peak_viewers = GREATEST(streams.peak_viewers, EXCLUDED.peak_viewers)
-                """, rows)
+                if rows:
+                    await self.db.executemany("""
+                        INSERT INTO streams (id, channel_id, title, game_name, started_at, peak_viewers, is_live)
+                        VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+                        ON CONFLICT (id) DO UPDATE SET
+                            title        = EXCLUDED.title,
+                            game_name    = EXCLUDED.game_name,
+                            peak_viewers = GREATEST(streams.peak_viewers, EXCLUDED.peak_viewers),
+                            is_live      = TRUE
+                    """, rows)
 
-                log.info(f"[Streams] Updated {len(rows)} stream(s)")
+                # Mark all streams as offline if their channel is no longer live
+                await self.db.execute("""
+                    UPDATE streams
+                    SET is_live = FALSE
+                    WHERE is_live = TRUE
+                      AND channel_id NOT IN (
+                          SELECT id FROM channels WHERE name = ANY($1::text[])
+                      )
+                """, list(live_channel_names))
+
+                log.info(f"[Streams] Updated {len(rows)} stream(s) | Live: {list(live_channel_names) or 'none'}")
 
             except Exception as e:
                 log.error(f"[Streams] Poll error: {e}")
@@ -263,7 +274,7 @@ async def main() -> None:
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
         min_size=2,
-        max_size=5,
+        max_size=10,
         statement_cache_size=0,
     )
     log.info("Connected to PostgreSQL.")
