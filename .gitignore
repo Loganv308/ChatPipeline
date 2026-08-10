@@ -205,3 +205,25 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+*.png
+
+# This project's venv was created at the repo root (python -m venv .)
+# rather than in .venv/, so its Scripts/Lib/Include layout needs its
+# own entries -- the generic "lib/"/"venv/" patterns above don't match
+# Windows' capitalized Scripts/Lib/Include dirs.
+/Scripts/
+/Lib/
+/Include/
+/pyvenv.cfg
+
+# Local SQLite buffer (store.py) and LogStream's local fallback log --
+# both are runtime state/output, not source.
+buffer.db
+buffer.db-shm
+buffer.db-wal
+logstream_fallback.log
+
+# Claude folder
+/.claude
