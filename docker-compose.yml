@@ -1,6 +1,7 @@
 services:
   collector:
     build: .
+    image: loganvelier/chatpipeline:latest
     command: ["python", "src/Worker.py"]
     restart: always
     env_file: .env
@@ -18,6 +19,7 @@ services:
 
   sync:
     build: .
+    image: loganvelier/chatpipeline:latest
     command: ["python", "src/Sync.py"]
     restart: always
     env_file: .env

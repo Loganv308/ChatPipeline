@@ -135,22 +135,19 @@ def extract_message(msg: Message, channel_id_map: dict, active_streams: dict) ->
     }, None
 
 
-# ─── Channel bootstrap (local cache only — no Postgres dependency) ────────
+# ─── Channel list (local cache only — no Postgres dependency) ────────
 #
 # The collector never talks to Postgres, full stop — not even at startup.
-# Normally sync.py pulls the channels table from Postgres and writes it
-# into store's channel_cache, and this just waits for that to happen.
 #
-# But if Postgres has never been reachable even once (not a transient
-# outage -- e.g. it's genuinely unreachable from this network), there's
-# nothing for sync.py to pull, and the collector would wait forever. For
-# that case, set SEED_CHANNELS in .env as a one-time manual bootstrap:
+# If SEED_CHANNELS is set in .env, it is the channel list: the collector
+# joins exactly those channels and nothing else, on every start. Their
+# ids are written into store's channel_cache, and sync.py pushes them
+# from there into Postgres's channels table so their messages can insert.
 #   SEED_CHANNELS=somechannel,otherchannel
-# (channel login name : numeric Twitch user id, comma-separated). This
-# gets written into the same local cache sync.py would have populated,
-# so it only needs to be read once -- after that the normal cache applies,
-# and sync.py will overwrite it with the real Postgres data once it can
-# finally connect.
+#
+# If SEED_CHANNELS is empty, the channel list comes from Postgres instead:
+# sync.py pulls the channels table into channel_cache, and this just
+# waits for that to happen.
 
 CHANNEL_CACHE_POLL_INTERVAL = 10  # seconds between checks while waiting
 
@@ -207,17 +204,16 @@ async def _resolve_channel_ids(usernames: list[str]) -> dict[str, int]:
     client without a full user login."""
     if not usernames:
         return {}
-    client_secret = os.getenv("TWITCH_TOKEN")
-    if not client_secret:
+    if not CLIENT_SECRET:
         log.error(
-            "Cannot resolve SEED_CHANNELS usernames: TWITCH_TOKEN "
+            "Cannot resolve SEED_CHANNELS usernames: TWITCH_CLIENT_SECRET "
             "is required for the API lookup but isn't set in .env."
         )
         return {}
     import twitchio
     try:
         client = await twitchio.Client.from_client_credentials(
-            client_id=CLIENT_ID, client_secret=client_secret
+            client_id=CLIENT_ID, client_secret=CLIENT_SECRET
         )
     except Exception as e:
         log.error(f"Failed to obtain an app access token for SEED_CHANNELS lookup: {e}")
@@ -237,24 +233,31 @@ async def _resolve_channel_ids(usernames: list[str]) -> dict[str, int]:
     return found
 
 async def wait_for_channel_map(db_conn) -> dict[str, int]:
-    channel_id_map = await store.load_cached_channel_map(db_conn)
+    cached = await store.load_cached_channel_map(db_conn)
+
+    explicit, plain_names = _parse_seed_channels()
+    if explicit or plain_names:
+        # Reuse ids already in the cache (from a previous run or from
+        # Postgres) so only genuinely new names hit the Twitch API.
+        seeded = dict(explicit)
+        to_lookup = []
+        for name in plain_names:
+            if name in cached:
+                seeded[name] = cached[name]
+            else:
+                to_lookup.append(name)
+        seeded.update(await _resolve_channel_ids(to_lookup))
+
+        if seeded:
+            await store.cache_channel_map(db_conn, seeded)
+            log.info(f"Using {len(seeded)} channel(s) from SEED_CHANNELS.")
+            return seeded
+        log.error("SEED_CHANNELS is set but none of its channels resolved; falling back to the local cache.")
+
+    channel_id_map = cached
     if channel_id_map:
         log.info(f"Loaded {len(channel_id_map)} channel(s) from local cache.")
         return channel_id_map
-
-    explicit, plain_names = _parse_seed_channels()
-    seeded = dict(explicit)
-    if plain_names:
-        seeded.update(await _resolve_channel_ids(plain_names))
-
-    if seeded:
-        await store.cache_channel_map(db_conn, seeded)
-        log.info(
-            f"Local cache was empty; bootstrapped {len(seeded)} channel(s) "
-            f"from SEED_CHANNELS. sync.py will overwrite this with real "
-            f"Postgres data once it can connect."
-        )
-        return seeded
 
     log.info(
         "Local channel cache is empty — waiting for sync.py to populate it "
@@ -451,7 +454,6 @@ async def main() -> None:
 
     try:
         await asyncio.gather(
-            bot.start(),
             bot.flush_to_local_buffer(),
             bot.log_stats(),
             bot.poll_streams(),

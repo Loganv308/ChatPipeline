@@ -21,7 +21,7 @@ import store
 
 load_dotenv()
 
-log = LogStream(service="ChatPipeline-Sync", host="http://10.10.0.97:3000")
+log = LogStream(service="ChatPipeline-Sync", host="http://10.10.0.175:3000")
 
 BATCH_SIZE          = 500
 SYNC_INTERVAL        = 5    # seconds between sync passes
@@ -100,6 +100,21 @@ async def pull_channel_map(db_conn, pg: asyncpg.Pool) -> int:
     return len(channel_id_map)
 
 
+async def push_channel_map(db_conn, pg: asyncpg.Pool) -> int:
+    """The reverse of pull_channel_map: makes sure every channel the
+    collector is watching (e.g. ones added via SEED_CHANNELS) exists in
+    Postgres, since streams and messages carry a foreign key to it.
+    Channels already there are left untouched."""
+    channel_id_map = await store.load_cached_channel_map(db_conn)
+    if not channel_id_map:
+        return 0
+    await pg.executemany("""
+        INSERT INTO channels (id, name) VALUES ($1, $2)
+        ON CONFLICT DO NOTHING
+    """, [(id_, name) for name, id_ in channel_id_map.items()])
+    return len(channel_id_map)
+
+
 async def sync_streams(db_conn, pg: asyncpg.Pool) -> int:
     rows = await store.fetch_all_streams(db_conn)
     if not rows:
@@ -156,11 +171,12 @@ async def main() -> None:
         while True:
             await asyncio.sleep(SYNC_INTERVAL)
 
-            # streams first: messages carry a foreign key to streams, so
-            # the stream row has to exist in Postgres before any message
-            # referencing it can insert. Each step is isolated (see
+            # channels, then streams, then messages: each carries a
+            # foreign key to the one before, so the referenced row has to
+            # exist in Postgres first. Each step is isolated (see
             # run_sync_step) so one failing step — e.g. a stray FK
             # violation — can't block the others from running.
+            _,         pg = await run_sync_step("channels", push_channel_map, db_conn, pg)
             n_streams, pg = await run_sync_step("streams",  sync_streams,  db_conn, pg)
             n_msg,     pg = await run_sync_step("messages", sync_messages, db_conn, pg)
             n_skip,    pg = await run_sync_step("skipped",  sync_skipped,  db_conn, pg)

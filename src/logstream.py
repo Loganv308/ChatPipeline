@@ -3,7 +3,7 @@ LogStream Client — Python
 Usage:
     from logstream import LogStream
 
-    log = LogStream(service="my-python-app", host="http://192.168.1.97:3000")
+    log = LogStream(service="my-python-app", host="http://10.10.0.175:3000")
     log.info("Server started")
     log.warn("High memory usage", metadata={"memory_mb": 1024})
     log.error("Database connection failed", metadata={"host": "db:5432"})
@@ -21,7 +21,7 @@ class LogStream:
     def __init__(
         self,
         service: str,
-        host: str = "http://192.168.1.97:3000",
+        host: str = "http://10.10.0.175:3000",
         batch_size: int = 10,
         fallback_path: str = "logstream_fallback.log",
     ):

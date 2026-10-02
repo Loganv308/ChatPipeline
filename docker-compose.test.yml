@@ -1,0 +1,30 @@
+services:
+  # Local, throwaway Postgres for testing. Separate from docker-compose.yml
+  # so it never gets started alongside the real collector/sync services.
+  #   docker compose -f docker-compose.test.yml up -d
+  # Schema + seed in db/init/ are applied only when the data volume is
+  # empty; to re-run them, reset with:
+  #   docker compose -f docker-compose.test.yml down -v
+  postgres-test:
+    image: postgres:17-alpine
+    container_name: chatpipeline-postgres-test
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: chatpipeline
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      # 5433 on the host so it can't be confused with (or collide with) a
+      # real Postgres on the default port.
+      - "5433:5432"
+    volumes:
+      - pgtestdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chatpipeline"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgtestdata:

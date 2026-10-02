@@ -154,9 +154,10 @@ async def mark_channels_offline(conn: aiosqlite.Connection, live_channel_ids: li
 
 
 async def cache_channel_map(conn: aiosqlite.Connection, channel_id_map: dict[str, int]) -> None:
+    # OR REPLACE rather than ON CONFLICT(id): name is UNIQUE too, and a
+    # name moving to a different id must replace the old row, not raise.
     await conn.executemany("""
-        INSERT INTO channel_cache (id, name) VALUES (?, ?)
-        ON CONFLICT(id) DO UPDATE SET name = excluded.name
+        INSERT OR REPLACE INTO channel_cache (id, name) VALUES (?, ?)
     """, [(v, k) for k, v in channel_id_map.items()])
     await conn.commit()
 

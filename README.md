@@ -77,7 +77,37 @@ Built as the data ingestion component of a larger Twitch analytics platform, Cha
 
 ## Database Setup
 
-Add the channels you want to track:
+### Local test database
+
+`docker-compose.test.yml` runs a throwaway Postgres 17 with the full schema (`db/init/01_schema.sql`) and two seed channels (`db/init/02_seed.sql`) applied automatically:
+
+```bash
+docker compose -f docker-compose.test.yml up -d --wait   # start
+docker compose -f docker-compose.test.yml down -v        # stop + wipe (re-runs db/init on next start)
+docker exec -it chatpipeline-postgres-test psql -U postgres -d chatpipeline   # shell
+```
+
+It listens on host port **5433** (`postgres` / `postgres`, database `chatpipeline`). To point the pipeline at it, set in `.env`:
+
+```dotenv
+DB_HOST=localhost              # or host.docker.internal when running via docker compose
+DB_PORT=5433
+DB_NAME=chatpipeline
+DB_USER=postgres
+DB_PASSWORD=postgres
+```
+
+### Channels
+
+The simplest way is to list them in `.env`:
+
+```bash
+SEED_CHANNELS=xqc,summit1g,moonmoon
+```
+
+When `SEED_CHANNELS` is set, the collector watches exactly those channels and nothing else, and the sync service adds them to the `channels` table for you. After editing `.env`, run `docker compose up -d` (Compose recreates the containers when the env changes).
+
+Alternatively, leave `SEED_CHANNELS` empty and manage the list in Postgres:
 
 ```sql
 INSERT INTO channels (name) VALUES
