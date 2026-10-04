@@ -136,6 +136,10 @@ celerybeat.pid
 
 # Environments
 .env
+.env.local
+db/prod/*.sql
+reports/
+reports-fallback/
 .envrc
 .venv
 env/
@@ -227,3 +231,7 @@ logstream_fallback.log
 
 # Claude folder
 /.claude
+
+# Production data folder
+db/dump_prod.sh
+db/prod/*

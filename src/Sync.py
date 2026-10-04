@@ -11,64 +11,73 @@ Run this as a separate process/container/service from worker.py.
 """
 import asyncio
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import asyncpg
 from dotenv import load_dotenv
 from logstream import LogStream
 
 import store
+from pgdb import connect_pg_with_retry
 
 load_dotenv()
 
-log = LogStream(service="ChatPipeline-Sync", host="http://10.10.0.175:3000")
+log = LogStream(service="ChatPipeline-Sync-Prod", host=os.getenv("LOG_HOST"))
 
 BATCH_SIZE          = 500
+DRAIN_BATCH_SIZE    = 2000  # messages per insert while working through a backlog
+DRAIN_BUDGET        = 4.0   # seconds per pass spent draining a backlog of messages
 SYNC_INTERVAL        = 5    # seconds between sync passes
-PG_RETRY_INTERVAL    = 15   # seconds between reconnect attempts while PG is down
 STATS_EVERY_N_CYCLES = 12   # ~ once a minute at a 5s interval
 
 
-async def connect_pg_with_retry() -> asyncpg.Pool:
+def parse_utc(iso: str) -> datetime:
+    """Parses a buffered ISO timestamp, treating one without an offset as
+    UTC. asyncpg would otherwise read a naive datetime as the container's
+    local time (TZ) and shift it by that offset on insert."""
+    dt = datetime.fromisoformat(iso)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+async def drain_messages(db_conn, pg: asyncpg.Pool) -> int:
+    """Inserts batches of buffered messages until the buffer is empty or
+    DRAIN_BUDGET runs out, so a backlog (e.g. from Backfill.py, or after
+    a Postgres outage) drains at thousands of messages per pass instead
+    of one batch."""
+    total = 0
+    deadline = asyncio.get_running_loop().time() + DRAIN_BUDGET
     while True:
-        try:
-            pool = await asyncpg.create_pool(
-                host=os.getenv("DB_HOST"),
-                port=int(os.getenv("DB_PORT", "5432")),
-                database=os.getenv("DB_NAME"),
-                user=os.getenv("DB_USER"),
-                password=os.getenv("DB_PASSWORD"),
-                min_size=1,
-                max_size=5,
-                statement_cache_size=0,
-            )
-            # create_pool doesn't itself guarantee the server is reachable
-            # until a query runs, so probe it once here.
-            async with pool.acquire() as conn:
-                await conn.execute("SELECT 1")
-            log.info("Connected to PostgreSQL.")
-            return pool
-        except Exception as e:
-            log.error(f"PostgreSQL unreachable ({e}); retrying in {PG_RETRY_INTERVAL}s.")
-            await asyncio.sleep(PG_RETRY_INTERVAL)
+        n = await sync_messages(db_conn, pg, DRAIN_BATCH_SIZE)
+        total += n
+        if n < DRAIN_BATCH_SIZE or asyncio.get_running_loop().time() > deadline:
+            return total
 
 
-async def sync_messages(db_conn, pg: asyncpg.Pool) -> int:
-    rows = await store.fetch_pending_messages(db_conn, BATCH_SIZE)
+async def sync_messages(db_conn, pg: asyncpg.Pool, limit: int = BATCH_SIZE) -> int:
+    rows = await store.fetch_pending_messages(db_conn, limit)
     if not rows:
         return 0
+    # Translate to Postgres's channels.id by name (every buffered message
+    # carries its channel name, whatever id scheme it was written with).
+    mapped, unmapped = [], []
+    for r in rows:
+        pg_id = pg_ids_by_name.get(r["channel"])
+        (mapped if pg_id is not None else unmapped).append((r, pg_id))
+    if unmapped:
+        names = sorted({r["channel"] for r, _ in unmapped})
+        log.error(f"Dropping {len(unmapped)} message(s) for channels missing from Postgres: {names}")
     await pg.executemany("""
         INSERT INTO messages
-            (message_id, channel_id, stream_id, user_id, username, message, timestamp, subscriber, is_bot)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (message_id, channel_id, channel_name, stream_id, user_id, username, message, timestamp, subscriber, is_bot)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (message_id) DO NOTHING
     """, [
-        (r["message_id"], r["channel_id"], r["stream_id"], r["user_id"], r["username"],
-         r["message"], datetime.fromisoformat(r["timestamp"]), bool(r["subscriber"]), bool(r["is_bot"]))
-        for r in rows
+        (r["message_id"], pg_id, r["channel"], r["stream_id"], r["user_id"], r["username"],
+         r["message"], parse_utc(r["timestamp"]), bool(r["subscriber"]), bool(r["is_bot"]))
+        for r, pg_id in mapped
     ])
     await store.delete_messages(db_conn, [r["id"] for r in rows])
-    return len(rows)
+    return len(mapped)
 
 
 async def sync_skipped(db_conn, pg: asyncpg.Pool) -> int:
@@ -81,43 +90,81 @@ async def sync_skipped(db_conn, pg: asyncpg.Pool) -> int:
         VALUES ($1, $2, $3, $4, $5, $6, $7)
     """, [
         (r["reason"], r["message_id"], r["channel_name"], r["username"],
-         r["content"], r["raw_tags"], datetime.fromisoformat(r["timestamp"]))
+         r["content"], r["raw_tags"], parse_utc(r["timestamp"]))
         for r in rows
     ])
     await store.delete_skipped(db_conn, [r["id"] for r in rows])
     return len(rows)
 
 
+# Postgres's own channels.id, keyed by Twitch user id and by name. The
+# local buffer only knows Twitch ids; these are rebuilt by
+# push_channel_map at the start of every sync pass and used to translate.
+pg_ids_by_twitch: dict[int, int] = {}
+pg_ids_by_name:   dict[str, int] = {}
+
+
 async def pull_channel_map(db_conn, pg: asyncpg.Pool) -> int:
     """Pushes Postgres's channels table into the local cache that the
-    collector (worker.py) reads at startup. This is the only place that
-    list flows in this direction — keeps the collector's Postgres
-    dependency at exactly zero."""
-    rows = await pg.fetch("SELECT id, name FROM channels")
-    channel_id_map = {r["name"]: r["id"] for r in rows}
-    if channel_id_map:
-        await store.cache_channel_map(db_conn, channel_id_map)
-    return len(channel_id_map)
+    collector (worker.py) reads at startup when SEED_CHANNELS is empty.
+    Only channels with a known twitch_id can be cached. This is the only
+    place that list flows in this direction — keeps the collector's
+    Postgres dependency at exactly zero."""
+    rows = await pg.fetch("SELECT name, twitch_id FROM channels WHERE twitch_id IS NOT NULL")
+    channel_map = {
+        r["name"].lower(): int(r["twitch_id"])
+        for r in rows if r["twitch_id"].strip().isdigit()
+    }
+    if channel_map:
+        await store.cache_channel_map(db_conn, channel_map)
+    return len(channel_map)
 
 
 async def push_channel_map(db_conn, pg: asyncpg.Pool) -> int:
     """The reverse of pull_channel_map: makes sure every channel the
-    collector is watching (e.g. ones added via SEED_CHANNELS) exists in
-    Postgres, since streams and messages carry a foreign key to it.
-    Channels already there are left untouched."""
-    channel_id_map = await store.load_cached_channel_map(db_conn)
-    if not channel_id_map:
-        return 0
-    await pg.executemany("""
-        INSERT INTO channels (id, name) VALUES ($1, $2)
-        ON CONFLICT DO NOTHING
-    """, [(id_, name) for name, id_ in channel_id_map.items()])
-    return len(channel_id_map)
+    collector is watching (e.g. ones added via SEED_CHANNELS) has a row
+    in Postgres with its twitch_id filled in, since streams and messages
+    carry a foreign key to it. Rows are matched by name; Postgres assigns
+    channels.id itself. Then rebuilds the id translation maps."""
+    channel_map = await store.load_cached_channel_map(db_conn)
+    if channel_map:
+        args = [(name, str(twitch_id)) for name, twitch_id in channel_map.items()]
+        async with pg.acquire() as conn, conn.transaction():
+            await conn.executemany("""
+                UPDATE channels SET twitch_id = $2::text
+                WHERE name = $1::text AND twitch_id IS NULL
+            """, args)
+            await conn.executemany("""
+                INSERT INTO channels (name, twitch_id)
+                SELECT $1::text, $2::text
+                WHERE NOT EXISTS (SELECT 1 FROM channels WHERE name = $1::text)
+            """, args)
+
+    rows = await pg.fetch("SELECT id, name, twitch_id FROM channels")
+    pg_ids_by_name.clear()
+    pg_ids_by_twitch.clear()
+    for r in rows:
+        pg_ids_by_name[r["name"].lower()] = r["id"]
+        if r["twitch_id"] and r["twitch_id"].strip().isdigit():
+            pg_ids_by_twitch[int(r["twitch_id"])] = r["id"]
+    return len(channel_map)
 
 
 async def sync_streams(db_conn, pg: asyncpg.Pool) -> int:
     rows = await store.fetch_all_streams(db_conn)
     if not rows:
+        return 0
+    # Translate Twitch user id -> channels.id. Rows buffered before the
+    # switch to Twitch ids may already hold a channels.id; keep those.
+    known_pg_ids = set(pg_ids_by_name.values())
+    mapped = []
+    for r in rows:
+        pg_id = pg_ids_by_twitch.get(r["channel_id"])
+        if pg_id is None and r["channel_id"] in known_pg_ids:
+            pg_id = r["channel_id"]
+        if pg_id is not None:
+            mapped.append((r, pg_id))
+    if not mapped:
         return 0
     await pg.executemany("""
         INSERT INTO streams (id, channel_id, title, game_name, started_at, peak_viewers, is_live)
@@ -128,12 +175,12 @@ async def sync_streams(db_conn, pg: asyncpg.Pool) -> int:
             peak_viewers = GREATEST(streams.peak_viewers, EXCLUDED.peak_viewers),
             is_live      = EXCLUDED.is_live
     """, [
-        (r["id"], r["channel_id"], r["title"], r["game_name"],
-         datetime.fromisoformat(r["started_at"]) if r["started_at"] else None,
+        (r["id"], pg_id, r["title"], r["game_name"],
+         parse_utc(r["started_at"]) if r["started_at"] else None,
          r["peak_viewers"], bool(r["is_live"]))
-        for r in rows
+        for r, pg_id in mapped
     ])
-    return len(rows)
+    return len(mapped)
 
 
 async def run_sync_step(label: str, fn, db_conn, pg: asyncpg.Pool) -> tuple[int, asyncpg.Pool]:
@@ -145,7 +192,7 @@ async def run_sync_step(label: str, fn, db_conn, pg: asyncpg.Pool) -> tuple[int,
     except (asyncpg.PostgresConnectionError, ConnectionError, OSError) as e:
         log.error(f"Lost PostgreSQL connection ({e}); reconnecting.")
         await pg.close()
-        pg = await connect_pg_with_retry()
+        pg = await connect_pg_with_retry(log)
         return 0, pg
     except Exception as e:
         log.error(f"Sync pass failed ({label}): {e}")
@@ -155,7 +202,7 @@ async def run_sync_step(label: str, fn, db_conn, pg: asyncpg.Pool) -> tuple[int,
 async def main() -> None:
     await store.init_db()
     db_conn = await store.get_connection()
-    pg = await connect_pg_with_retry()
+    pg = await connect_pg_with_retry(log)
 
     try:
         n_channels = await pull_channel_map(db_conn, pg)
@@ -178,7 +225,7 @@ async def main() -> None:
             # violation — can't block the others from running.
             _,         pg = await run_sync_step("channels", push_channel_map, db_conn, pg)
             n_streams, pg = await run_sync_step("streams",  sync_streams,  db_conn, pg)
-            n_msg,     pg = await run_sync_step("messages", sync_messages, db_conn, pg)
+            n_msg,     pg = await run_sync_step("messages", drain_messages, db_conn, pg)
             n_skip,    pg = await run_sync_step("skipped",  sync_skipped,  db_conn, pg)
 
             totals["messages"] += n_msg

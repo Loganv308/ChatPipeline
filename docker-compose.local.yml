@@ -1,0 +1,108 @@
+# Full local stack (collector, sync, sanitizer) built from the working
+# tree, running against a local Postgres created from a dump of the
+# production schema in db/prod/. For testing changes before pushing an
+# image to the server.
+#
+#   docker compose -f docker-compose.local.yml up -d --build
+#   docker compose -f docker-compose.local.yml logs -f
+#   docker compose -f docker-compose.local.yml down -v   # stop + wipe (re-runs db/prod on next start)
+#
+# Separate project name, volumes and no `image:` tags, so it can never
+# share state with docker-compose.yml or be pushed by `docker compose push`.
+#
+# Settings come from .env, then .env.local if it exists (later file wins).
+# Put a separate Twitch token pair in .env.local -- sharing the server's
+# TWITCH_REFRESH_TOKEN can log the server out when either side refreshes.
+name: chatpipeline-local
+
+x-app: &app
+  build: .
+  restart: unless-stopped
+  env_file:
+    - path: .env
+    - path: .env.local
+      required: false
+  environment: &app-env
+    LOCAL_BUFFER_PATH: /data/buffer.db
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    DB_NAME: chatpipeline
+    DB_USER: postgres
+    DB_PASSWORD: postgres
+  volumes:
+    - localbuffer:/data
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  postgres:
+    # Match production's major version (SELECT version();) -- pg_dump
+    # output from a newer server may not load into an older one.
+    image: postgres:${PG_VERSION:-18}-alpine
+    container_name: chatpipeline-postgres-local
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: chatpipeline
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      # 5435 on the host: clear of a real Postgres (5432) and the
+      # schema-only test database in docker-compose.test.yml (5433).
+      - "5435:5432"
+    volumes:
+      # postgres 18+ images keep data under /var/lib/postgresql/<major>/;
+      # mounting the old /var/lib/postgresql/data path makes them refuse
+      # to start.
+      - pglocaldata:/var/lib/postgresql
+      - ./db/prod:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chatpipeline"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  collector:
+    <<: *app
+    command: ["python", "src/Worker.py"]
+
+  sync:
+    <<: *app
+    command: ["python", "src/Sync.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  sanitizer:
+    <<: *app
+    command: ["python", "src/Sanitizer.py"]
+    volumes: []
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backfill:
+    <<: *app
+    command: ["python", "src/Backfill.py"]
+
+  reporter:
+    <<: *app
+    command: ["python", "src/Reporter.py"]
+    volumes:
+      - ${REPORTS_PATH:-./reports}:/reports
+      - ${REPORTS_FALLBACK_PATH:-./reports-fallback}:/reports-fallback
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Serves REPORTS_PATH (index.html + each day's page) read-only on port 8090.
+  reports-web:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "8090:80"
+    volumes:
+      - ${REPORTS_PATH:-./reports}:/usr/share/nginx/html:ro
+
+volumes:
+  pglocaldata:
+  localbuffer:

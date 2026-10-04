@@ -9,9 +9,9 @@ is unreachable. sync.py is the process responsible for draining the
 buffer into Postgres.
 """
 import asyncio
-import re
-import html
 import json
+import signal
+from collections import deque
 from datetime import datetime, timezone
 
 import aiohttp
@@ -22,6 +22,8 @@ from dotenv import load_dotenv
 
 import os
 import store
+from sanitize import BOT_NAMES, sanitize_message, sanitize_username
+from irc import parse_privmsg, record_from_privmsg
 
 load_dotenv()
 
@@ -30,20 +32,14 @@ CLIENT_ID     = os.getenv("TWITCH_CLIENT_ID")
 CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
 REFRESH_TOKEN = os.getenv("TWITCH_REFRESH_TOKEN")
 
-BOT_NAMES = {"streamelements", "nightbot", "fossabot", "moobot", "streamlabs"}
-
-log = LogStream(service="ChatPipeline-Worker", host=os.getenv("LOG_HOST"))
+log = LogStream(service="ChatPipeline-Worker-Prod", host=os.getenv("LOG_HOST"))
 
 LOCAL_FLUSH_INTERVAL = 2      # seconds between local buffer writes
 STREAM_POLL_INTERVAL = 60     # seconds between Twitch stream-status polls
 TOKEN_REFRESH_FRACTION = 0.8  # refresh once this much of the token's lifetime has elapsed
-
-
-class TokenRefreshRestart(Exception):
-    """Raised to unwind asyncio.gather() in main() for a clean restart
-    after proactively refreshing the Twitch token -- twitchio's IRC
-    connection can't hot-swap its token, so applying a new one means
-    exiting so restart:always brings up a fresh process."""
+JOIN_TIMEOUT = 30             # seconds to wait for a new connection to join every channel
+SWAP_OVERLAP = 5              # seconds both connections stay open during a token-refresh swap
+SEEN_IDS_MAX = 100_000        # recent message ids remembered for de-duplication
 
 
 # ─── OAuth token refresh ────────────────────────────────────────────────────
@@ -56,10 +52,11 @@ class TokenRefreshRestart(Exception):
 #   - Twitch rotates the refresh token on every use, so the new one is
 #     persisted to the local buffer DB (survives container restarts) --
 #     the .env value only ever works for the very first exchange
-#   - a background task re-exchanges it before the access token expires,
-#     then exits the process; restart:always (docker-compose.yml) brings
-#     a fresh process up, which reads the now-persisted refresh token and
-#     gets a fresh access token at boot
+#   - a background task re-exchanges it before the access token expires
+#     and swaps in a second chat connection using the new token, closing
+#     the old one only once the new one has joined every channel, so no
+#     chat is missed (messages both connections see are de-duplicated by
+#     id) -- twitchio's IRC connection can't hot-swap its token in place
 
 async def _exchange_refresh_token(refresh_token: str) -> dict:
     async with aiohttp.ClientSession() as session:
@@ -94,18 +91,8 @@ async def get_fresh_access_token(db_conn) -> tuple[str, int | None]:
 
 # ─── ETL: Transform / Sanitize ─────────────────────────────────────────────
 
-def sanitize_message(text: str) -> str:
-    if not text:
-        return "[EMPTY MESSAGE]"
-    text = html.unescape(text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    text = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', text)
-    return text[:500]
-
-def sanitize_username(username: str) -> str:
-    if not username:
-        return "anonymous"
-    return username.strip().lower()[:25]
+# sanitize_message / sanitize_username / BOT_NAMES live in sanitize.py,
+# shared with Sanitizer.py so stored rows are repaired to the same rules.
 
 def extract_message(msg: Message, channel_id_map: dict, active_streams: dict) -> tuple[dict | None, str | None]:
 
@@ -129,7 +116,10 @@ def extract_message(msg: Message, channel_id_map: dict, active_streams: dict) ->
         "user_id":    str(msg.author.id) if msg.author.id else None,
         "username":   username,
         "message":    sanitize_message(msg.content),
-        "timestamp":  (msg.timestamp or datetime.now(timezone.utc)).isoformat(),
+        # twitchio returns a naive datetime holding UTC; tag it as UTC so
+        # nothing downstream reads it as the container's local time (TZ).
+        "timestamp":  (msg.timestamp.replace(tzinfo=timezone.utc) if msg.timestamp
+                       else datetime.now(timezone.utc)).isoformat(),
         "subscriber": int(bool(msg.author.is_subscriber)),
         "is_bot":     int(username in BOT_NAMES),
     }, None
@@ -141,12 +131,13 @@ def extract_message(msg: Message, channel_id_map: dict, active_streams: dict) ->
 #
 # If SEED_CHANNELS is set in .env, it is the channel list: the collector
 # joins exactly those channels and nothing else, on every start. Their
-# ids are written into store's channel_cache, and sync.py pushes them
-# from there into Postgres's channels table so their messages can insert.
+# Twitch user ids are written into store's twitch_channels cache, and
+# sync.py pushes them from there into Postgres's channels table (matched
+# by name, filling twitch_id) so their messages can insert.
 #   SEED_CHANNELS=somechannel,otherchannel
 #
 # If SEED_CHANNELS is empty, the channel list comes from Postgres instead:
-# sync.py pulls the channels table into channel_cache, and this just
+# sync.py pulls the channels table into twitch_channels, and this just
 # waits for that to happen.
 
 CHANNEL_CACHE_POLL_INTERVAL = 10  # seconds between checks while waiting
@@ -198,10 +189,9 @@ def _parse_seed_channels() -> tuple[dict[str, int], list[str]]:
 
 async def _resolve_channel_ids(usernames: list[str]) -> dict[str, int]:
     """Looks up numeric Twitch user ids for plain usernames via the Twitch
-    API. Uses an app access token generated from client_id/client_secret --
-    twitchio 2.x's plain Client doesn't accept token=/client_id= directly,
-    so from_client_credentials() is the documented way to get an API-only
-    client without a full user login."""
+    API. Uses an app access token generated from client_id/client_secret,
+    calling Helix directly -- twitchio 2.x's from_client_credentials()
+    returns a half-initialized Client that isn't safe to await or close."""
     if not usernames:
         return {}
     if not CLIENT_SECRET:
@@ -210,23 +200,40 @@ async def _resolve_channel_ids(usernames: list[str]) -> dict[str, int]:
             "is required for the API lookup but isn't set in .env."
         )
         return {}
-    import twitchio
-    try:
-        client = await twitchio.Client.from_client_credentials(
-            client_id=CLIENT_ID, client_secret=CLIENT_SECRET
-        )
-    except Exception as e:
-        log.error(f"Failed to obtain an app access token for SEED_CHANNELS lookup: {e}")
-        return {}
-    try:
-        users = await client.fetch_users(names=usernames)
-    except Exception as e:
-        log.error(f"Failed to resolve SEED_CHANNELS usernames via Twitch API: {e}")
-        return {}
-    finally:
-        await client.close()
 
-    found = {u.name.lower(): int(u.id) for u in users}
+    found: dict[str, int] = {}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post("https://id.twitch.tv/oauth2/token", data={
+                "grant_type":    "client_credentials",
+                "client_id":     CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+            }) as resp:
+                body = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(f"({resp.status}): {body}")
+                app_token = body["access_token"]
+        except Exception as e:
+            log.error(f"Failed to obtain an app access token for SEED_CHANNELS lookup: {e}")
+            return {}
+
+        headers = {"Client-Id": CLIENT_ID, "Authorization": f"Bearer {app_token}"}
+        try:
+            # Helix accepts at most 100 logins per request.
+            for i in range(0, len(usernames), 100):
+                params = [("login", name) for name in usernames[i:i + 100]]
+                async with session.get(
+                    "https://api.twitch.tv/helix/users", params=params, headers=headers
+                ) as resp:
+                    body = await resp.json()
+                    if resp.status != 200:
+                        raise RuntimeError(f"({resp.status}): {body}")
+                    for user in body["data"]:
+                        found[user["login"].lower()] = int(user["id"])
+        except Exception as e:
+            log.error(f"Failed to resolve SEED_CHANNELS usernames via Twitch API: {e}")
+            return found
+
     missing = set(usernames) - set(found)
     if missing:
         log.error(f"SEED_CHANNELS: could not resolve these usernames on Twitch: {sorted(missing)}")
@@ -272,37 +279,106 @@ async def wait_for_channel_map(db_conn) -> dict[str, int]:
     return channel_id_map
 
 
-# ─── Bot ───────────────────────────────────────────────────────────────────
+# ─── Recent-messages backfill ─────────────────────────────────────────────
+#
+# Twitch has no chat history API: anything sent while the collector isn't
+# connected never arrives over IRC. recent-messages.robotty.de (the
+# service the Chatterino client uses) keeps roughly the last 800 messages
+# per channel, with Twitch's own message ids and send times. On startup
+# the collector buffers any of those newer than the last message it saved
+# for that channel. Overlap with live chat is harmless: duplicates are
+# dropped in memory by message id, and again by Sync.py's
+# ON CONFLICT (message_id).
 
-class ScraperBot(commands.Bot):
-    def __init__(
-        self, db_conn, channel_id_map: dict[str, int], channels: list[str],
-        access_token: str, token_ttl: int | None,
-    ):
-        self.db              = db_conn
-        self.channel_id_map  = channel_id_map
-        self.channels        = channels
-        self.token_ttl       = token_ttl
-        self.msg_queue: list[dict] = []
-        self.skip_queue: list[dict] = []
-        self.active_streams: dict[str, str] = {}
-        self.stats = {"received": 0, "buffered": 0, "skipped": 0, "errors": 0}
+RECENT_MESSAGES_URL = "https://recent-messages.robotty.de/api/v2/recent-messages/{}"
+LAST_SEEN_KEY = "last_seen_ts:{}"  # kv_state: send time of the newest saved message per channel
 
+# parse_privmsg / record_from_privmsg live in irc.py, shared with Backfill.py.
+
+
+# ─── Chat connection ───────────────────────────────────────────────────────
+
+class ChatConnection(commands.Bot):
+    """One authenticated IRC connection. Holds no state of its own beyond
+    join tracking -- everything it receives goes to the Collector, so a
+    connection can be replaced (token refresh) without losing anything."""
+
+    def __init__(self, collector: "Collector", access_token: str):
+        self.collector  = collector
+        self.ready      = asyncio.Event()
+        self.joined:    set[str] = set()
+        self.all_joined = asyncio.Event()
         super().__init__(
             token=access_token,
             prefix="!",
-            initial_channels=channels,
+            initial_channels=collector.channels,
             client_id=CLIENT_ID,
             client_secret=CLIENT_SECRET,
         )
 
     async def event_ready(self) -> None:
-        log.info(f"Worker ready | Watching: {', '.join(self.channels)}")
+        self.ready.set()
+
+    async def event_channel_joined(self, channel) -> None:
+        self.joined.add(channel.name.lower())
+        if self.joined >= set(self.collector.channels):
+            self.all_joined.set()
 
     async def event_message(self, message) -> None:
         if message.echo:
             return
+        self.collector.handle_message(message)
 
+    async def wait_until_joined(self) -> bool:
+        """True once connected and every channel is joined, or connected
+        with some joins still outstanding after JOIN_TIMEOUT (logged).
+        False if it never connected at all."""
+        try:
+            await asyncio.wait_for(self.all_joined.wait(), JOIN_TIMEOUT)
+        except asyncio.TimeoutError:
+            if not self.ready.is_set():
+                return False
+            missing = sorted(set(self.collector.channels) - self.joined)
+            log.error(f"Chat connected but these channels didn't join within {JOIN_TIMEOUT}s: {missing}")
+        return True
+
+
+# ─── Collector ─────────────────────────────────────────────────────────────
+
+class Collector:
+    def __init__(self, db_conn, channel_id_map: dict[str, int], token_ttl: int | None):
+        self.db              = db_conn
+        self.channel_id_map  = channel_id_map
+        self.channels        = list(channel_id_map.keys())
+        self.token_ttl       = token_ttl
+        self.msg_queue: list[dict] = []
+        self.skip_queue: list[tuple] = []
+        self.active_streams: dict[str, str] = {}               # channel -> live stream id
+        self.active_stream_started: dict[str, datetime] = {}   # channel -> that stream's start
+        self.stats = {"received": 0, "buffered": 0, "skipped": 0, "errors": 0, "backfilled": 0}
+        self._seen_order: deque[str] = deque()
+        self._seen_ids:   set[str] = set()
+        self.chat: ChatConnection | None = None
+        self.chat_task: asyncio.Task | None = None
+
+    # ── Ingest ──
+
+    def _first_sighting(self, message_id: str | None) -> bool:
+        """False if this id was already queued, e.g. by both connections
+        during a token-refresh overlap, or by backfill and live chat."""
+        if not message_id:
+            return True
+        if message_id in self._seen_ids:
+            return False
+        self._seen_ids.add(message_id)
+        self._seen_order.append(message_id)
+        if len(self._seen_order) > SEEN_IDS_MAX:
+            self._seen_ids.discard(self._seen_order.popleft())
+        return True
+
+    def handle_message(self, message) -> None:
+        if not self._first_sighting(message.id):
+            return
         self.stats["received"] += 1
 
         record, skip_reason = extract_message(message, self.channel_id_map, self.active_streams)
@@ -321,66 +397,169 @@ class ScraperBot(commands.Bot):
             return
 
         self.msg_queue.append(record)
-        await self.handle_commands(message)
 
-    async def event_command_error(self, ctx, error) -> None:
-        if isinstance(error, commands.CommandNotFound):
-            return
-        raise error
+    # ── Local buffer ──
+
+    async def flush_once(self) -> None:
+        """Writes everything queued to SQLite. Never depends on Postgres,
+        so it never blocks or fails because the database server is down."""
+        if self.msg_queue:
+            batch, self.msg_queue = self.msg_queue, []
+            try:
+                rows = [(
+                    m["message_id"], m["channel"], m["channel_id"], m["stream_id"],
+                    m["user_id"], m["username"], m["message"], m["timestamp"],
+                    m["subscriber"], m["is_bot"],
+                ) for m in batch]
+                await store.insert_messages(self.db, rows)
+                self.stats["buffered"] += len(batch)
+            except Exception as e:
+                self.stats["errors"] += 1
+                log.error(f"Local buffer write error (messages): {e}")
+                self.msg_queue = batch + self.msg_queue
+            else:
+                await self._record_last_seen(batch)
+
+        if self.skip_queue:
+            batch, self.skip_queue = self.skip_queue, []
+            try:
+                await store.insert_skipped(self.db, batch)
+            except Exception as e:
+                self.stats["errors"] += 1
+                log.error(f"Local buffer write error (skipped): {e}")
+                self.skip_queue = batch + self.skip_queue
+
+    async def _record_last_seen(self, batch: list[dict]) -> None:
+        """Remembers the newest send time saved per channel, which is where
+        the next startup's backfill picks up from."""
+        try:
+            newest: dict[str, datetime] = {}
+            for m in batch:
+                ts = datetime.fromisoformat(m["timestamp"])
+                if m["channel"] not in newest or ts > newest[m["channel"]]:
+                    newest[m["channel"]] = ts
+            updates = {}
+            for channel, ts in newest.items():
+                current = await store.load_kv(self.db, LAST_SEEN_KEY.format(channel))
+                if not current or ts > datetime.fromisoformat(current):
+                    updates[LAST_SEEN_KEY.format(channel)] = ts.isoformat()
+            await store.save_kv_many(self.db, updates)
+        except Exception as e:
+            log.error(f"Couldn't record last-seen message times: {e}")
 
     async def flush_to_local_buffer(self) -> None:
-        """Writes everything to SQLite. This never depends on Postgres,
-        so it never blocks or fails because the database server is down."""
         while True:
             await asyncio.sleep(LOCAL_FLUSH_INTERVAL)
+            await self.flush_once()
 
-            if self.msg_queue:
-                batch, self.msg_queue = self.msg_queue, []
-                try:
-                    rows = [(
-                        m["message_id"], m["channel"], m["channel_id"], m["stream_id"],
-                        m["user_id"], m["username"], m["message"], m["timestamp"],
-                        m["subscriber"], m["is_bot"],
-                    ) for m in batch]
-                    await store.insert_messages(self.db, rows)
-                    self.stats["buffered"] += len(batch)
-                except Exception as e:
-                    self.stats["errors"] += 1
-                    log.error(f"Local buffer write error (messages): {e}")
-                    self.msg_queue = batch + self.msg_queue
+    # ── Backfill ──
 
-            if self.skip_queue:
-                batch, self.skip_queue = self.skip_queue, []
+    async def backfill_recent_messages(self) -> None:
+        """Buffers each channel's recent messages (see the section comment
+        above) that are newer than the last one saved before this start."""
+        total = 0
+        timeout = aiohttp.ClientTimeout(total=20)
+        headers = {"User-Agent": "ChatPipeline (Twitch chat archiver)"}
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            for channel in self.channels:
                 try:
-                    await store.insert_skipped(self.db, batch)
+                    async with session.get(RECENT_MESSAGES_URL.format(channel)) as resp:
+                        body = await resp.json()
+                    if body.get("error"):
+                        raise RuntimeError(f"{body.get('error_code')}: {body['error']}")
                 except Exception as e:
-                    self.stats["errors"] += 1
-                    log.error(f"Local buffer write error (skipped): {e}")
-                    self.skip_queue = batch + self.skip_queue
+                    log.error(f"[Backfill] {channel}: recent-messages unavailable ({e})")
+                    continue
+
+                last_seen_raw = await store.load_kv(self.db, LAST_SEEN_KEY.format(channel))
+                last_seen = datetime.fromisoformat(last_seen_raw) if last_seen_raw else None
+                started   = self.active_stream_started.get(channel)
+
+                added = 0
+                for line in body.get("messages", []):
+                    parsed = parse_privmsg(line)
+                    if not parsed or parsed["channel"] != channel:
+                        continue
+                    record = record_from_privmsg(parsed, self.channel_id_map[channel], None)
+                    if record is None:
+                        continue
+                    sent = datetime.fromisoformat(record["timestamp"])
+                    if last_seen and sent <= last_seen:
+                        continue
+                    # Only attribute it to the current stream if it was sent
+                    # during that stream; earlier messages stay unattributed.
+                    if started and sent >= started:
+                        record["stream_id"] = self.active_streams.get(channel)
+                    if self._first_sighting(record["message_id"]):
+                        self.msg_queue.append(record)
+                        added += 1
+                if added:
+                    since = f"since {last_seen_raw}" if last_seen_raw else "(no previous save)"
+                    log.info(f"[Backfill] {channel}: {added} message(s) {since}")
+                total += added
+
+        self.stats["backfilled"] += total
+        log.info(f"[Backfill] Recovered {total} message(s) across {len(self.channels)} channel(s).")
+
+    # ── Chat connection lifecycle ──
+
+    async def connect_chat(self, access_token: str) -> bool:
+        """Starts a new connection and makes it the active one once it has
+        joined. The previous connection (if any) is closed only after
+        that, so the two overlap rather than leaving a gap."""
+        new = ChatConnection(self, access_token)
+        if self.chat is None:
+            # First connection: learn which channels are live before chat
+            # starts flowing, so the first messages get their stream_id.
+            # (Uses only the API side of the connection, not IRC.)
+            await self.poll_streams_once(new)
+        task = asyncio.create_task(new.start())
+        if not await new.wait_until_joined():
+            task.cancel()
+            return False
+        old = self.chat
+        self.chat, self.chat_task = new, task
+        log.info(f"Worker ready | Watching: {', '.join(self.channels)}")
+        if old is not None:
+            # Keep the old connection briefly so nothing in flight to it is
+            # lost; messages both receive are dropped by _first_sighting.
+            await asyncio.sleep(SWAP_OVERLAP)
+            await old.close()
+        return True
+
+    async def watch_chat(self) -> None:
+        """Ends the process if the active connection dies on its own
+        (restart:always then brings a fresh one up). A connection closed
+        because it was replaced is expected and ignored."""
+        while True:
+            task = self.chat_task
+            await task
+            if task is self.chat_task:
+                raise RuntimeError("Chat connection closed unexpectedly.")
 
     async def refresh_token_periodically(self) -> None:
-        """No-op if no refresh token is configured (self.token_ttl is
-        None). Otherwise, proactively re-exchanges the refresh token
-        before the current access token expires, then exits the process
-        cleanly so restart:always brings up a fresh one -- twitchio's
-        IRC connection can't hot-swap its token, so a restart is the
-        reliable way to apply a new one."""
+        """No-op if no refresh token is configured. Otherwise exchanges the
+        refresh token before the access token expires and swaps in a new
+        connection with it (see connect_chat)."""
         if self.token_ttl is None:
             return
         wait = self.token_ttl * TOKEN_REFRESH_FRACTION
         while True:
             await asyncio.sleep(wait)
             try:
-                await get_fresh_access_token(self.db)
+                access_token, ttl = await get_fresh_access_token(self.db)
+                if not await self.connect_chat(access_token):
+                    raise RuntimeError("new chat connection didn't connect")
             except Exception as e:
-                # Current token is still valid for now -- retry sooner
-                # than waiting out the full TTL again rather than crash
-                # on a transient refresh failure.
+                # The current connection keeps running on its still-valid
+                # token -- retry well before it expires.
                 log.error(f"Proactive token refresh failed: {e}")
                 wait = 300
                 continue
-            log.info("Refreshed Twitch token proactively; restarting to apply it.")
-            raise TokenRefreshRestart()
+            log.info("Swapped chat connection onto refreshed token with no gap.")
+            wait = ttl * TOKEN_REFRESH_FRACTION
+
+    # ── Stats / streams ──
 
     async def log_stats(self) -> None:
         while True:
@@ -389,79 +568,108 @@ class ScraperBot(commands.Bot):
             log.info(
                 f"[Stats] received={self.stats['received']} "
                 f"buffered={self.stats['buffered']} "
+                f"backfilled={self.stats['backfilled']} "
                 f"skipped={self.stats['skipped']} "
                 f"errors={self.stats['errors']} "
                 f"local_backlog={pending}"
             )
 
+    async def poll_streams_once(self, client: ChatConnection | None = None) -> None:
+        try:
+            streams = await (client or self.chat).fetch_streams(user_logins=self.channels)
+
+            live_channel_ids = []
+            rows = []
+
+            for stream in streams:
+                channel_name = stream.user.name.lower()
+                channel_id   = self.channel_id_map.get(channel_name)
+                if channel_id is None:
+                    continue
+
+                live_channel_ids.append(channel_id)
+                self.active_streams[channel_name] = stream.id
+                if stream.started_at:
+                    self.active_stream_started[channel_name] = stream.started_at
+
+                rows.append((
+                    stream.id,
+                    channel_id,
+                    stream.title,
+                    stream.game_name,
+                    stream.started_at.isoformat() if stream.started_at else None,
+                    stream.viewer_count,
+                ))
+
+            # Channels that dropped off the live list get their local
+            # 'active_streams' entry cleared too, so new messages stop
+            # getting tagged with a stale stream_id.
+            now_live_names = {s.user.name.lower() for s in streams}
+            for name in list(self.active_streams):
+                if name not in now_live_names:
+                    del self.active_streams[name]
+                    self.active_stream_started.pop(name, None)
+
+            if rows:
+                await store.upsert_streams(self.db, rows)
+            await store.mark_channels_offline(self.db, live_channel_ids)
+
+            log.info(f"[Streams] Buffered {len(rows)} live stream(s) | Live: {list(now_live_names) or 'none'}")
+
+        except Exception as e:
+            log.error(f"[Streams] Poll error: {e}")
+
     async def poll_streams(self) -> None:
         while True:
-            try:
-                streams = await self.fetch_streams(user_logins=self.channels)
-
-                live_channel_ids = []
-                rows = []
-
-                for stream in streams:
-                    channel_name = stream.user.name.lower()
-                    channel_id   = self.channel_id_map.get(channel_name)
-                    if channel_id is None:
-                        continue
-
-                    live_channel_ids.append(channel_id)
-                    self.active_streams[channel_name] = stream.id
-
-                    rows.append((
-                        stream.id,
-                        channel_id,
-                        stream.title,
-                        stream.game_name,
-                        stream.started_at.isoformat() if stream.started_at else None,
-                        stream.viewer_count,
-                    ))
-
-                # Channels that dropped off the live list get their local
-                # 'active_streams' entry cleared too, so new messages stop
-                # getting tagged with a stale stream_id.
-                now_live_names = {s.user.name.lower() for s in streams}
-                for name in list(self.active_streams):
-                    if name not in now_live_names:
-                        del self.active_streams[name]
-
-                if rows:
-                    await store.upsert_streams(self.db, rows)
-                await store.mark_channels_offline(self.db, live_channel_ids)
-
-                log.info(f"[Streams] Buffered {len(rows)} live stream(s) | Live: {list(now_live_names) or 'none'}")
-
-            except Exception as e:
-                log.error(f"[Streams] Poll error: {e}")
-
             await asyncio.sleep(STREAM_POLL_INTERVAL)
+            await self.poll_streams_once()
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    # docker stop sends SIGTERM; turn it into a cancellation so the finally
+    # block below gets to write queued messages before the process exits.
+    main_task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, main_task.cancel)
+        except (NotImplementedError, AttributeError):
+            pass  # Windows: Ctrl+C still raises KeyboardInterrupt
+
     await store.init_db()
     db_conn = await store.get_connection()
-
-    channel_id_map = await wait_for_channel_map(db_conn)
-    channels = list(channel_id_map.keys())
-
-    access_token, token_ttl = await get_fresh_access_token(db_conn)
-    bot = ScraperBot(db_conn, channel_id_map, channels, access_token, token_ttl)
+    collector = None
 
     try:
+        channel_id_map = await wait_for_channel_map(db_conn)
+        access_token, token_ttl = await get_fresh_access_token(db_conn)
+        collector = Collector(db_conn, channel_id_map, token_ttl)
+
+        if not await collector.connect_chat(access_token):
+            raise RuntimeError("Couldn't connect to Twitch chat.")
+
+        # Live chat is already flowing; now fill in what was missed while
+        # down. (connect_chat polled streams first, so backfilled messages
+        # sent during the current stream get its stream_id.)
+        await collector.backfill_recent_messages()
+
         await asyncio.gather(
-            bot.flush_to_local_buffer(),
-            bot.log_stats(),
-            bot.poll_streams(),
-            bot.refresh_token_periodically(),
+            collector.watch_chat(),
+            collector.flush_to_local_buffer(),
+            collector.log_stats(),
+            collector.poll_streams(),
+            collector.refresh_token_periodically(),
         )
-    except TokenRefreshRestart:
-        pass
+    except asyncio.CancelledError:
+        log.info("Shutting down; writing queued messages first.")
     finally:
+        if collector is not None:
+            await collector.flush_once()
+            if collector.chat is not None:
+                await collector.chat.close()
+        await log.flush()
         await db_conn.close()
 
 if __name__ == "__main__":

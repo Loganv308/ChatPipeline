@@ -3,7 +3,7 @@ LogStream Client — Python
 Usage:
     from logstream import LogStream
 
-    log = LogStream(service="my-python-app", host="http://10.10.0.175:3000")
+    log = LogStream(service="my-python-app", host="${LOG_HOST}")
     log.info("Server started")
     log.warn("High memory usage", metadata={"memory_mb": 1024})
     log.error("Database connection failed", metadata={"host": "db:5432"})
@@ -16,12 +16,25 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+
+def _local_tz():
+    """Timezone for the stdout copy of each log line, from the TZ env var
+    (e.g. TZ=America/Chicago). Falls back to UTC if unset or unknown.
+    Entries sent to the LogStream server always stay in UTC."""
+    try:
+        return ZoneInfo(os.getenv("TZ") or "UTC")
+    except Exception:
+        return timezone.utc
+
+LOCAL_TZ = _local_tz()
 
 class LogStream:
     def __init__(
         self,
         service: str,
-        host: str = "http://10.10.0.175:3000",
+        host: str = os.getenv("LOG_HOST"),
         batch_size: int = 10,
         fallback_path: str = "logstream_fallback.log",
     ):
@@ -41,16 +54,31 @@ class LogStream:
                 pass
 
     def _enqueue(self, level: str, message: str, metadata: Optional[dict]) -> None:
-        self._queue.append({
+        entry = {
             "level":   level,
             "service": self.service,
             "message": message,
             "ts":      datetime.now(timezone.utc).isoformat(),
             **({"metadata": metadata} if metadata else {}),
-        })
+        }
+        self._print_local(entry)
+        self._queue.append(entry)
         self._ensure_task()
         if len(self._queue) >= self.batch_size:
             asyncio.ensure_future(self._flush())
+
+    @staticmethod
+    def _print_local(entry: dict) -> None:
+        """Mirrors every entry to stdout so it also shows up in
+        `docker compose logs`, independent of whether the LogStream
+        server is reachable. Shown in LOCAL_TZ, e.g.
+        2026-10-02 09:03:31.334 CDT."""
+        local = datetime.fromisoformat(entry["ts"]).astimezone(LOCAL_TZ)
+        ts = f"{local:%Y-%m-%d %H:%M:%S}.{local.microsecond // 1000:03d} {local:%Z}"
+        line = f"{ts} {entry['level']:<5} [{entry['service']}] {entry['message']}"
+        if "metadata" in entry:
+            line += f" {json.dumps(entry['metadata'])}"
+        print(line, flush=True)
 
     async def _flush_loop(self) -> None:
         while True:

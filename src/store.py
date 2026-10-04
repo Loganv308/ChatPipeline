@@ -56,11 +56,14 @@ CREATE TABLE IF NOT EXISTS pending_streams (
     updated_at    TEXT DEFAULT (datetime('now'))
 );
 
--- Cached channel name -> id map so the worker can boot even if Postgres
--- is unreachable at startup.
-CREATE TABLE IF NOT EXISTS channel_cache (
-    id    INTEGER PRIMARY KEY,
-    name  TEXT NOT NULL UNIQUE
+-- Channel login name -> numeric Twitch user id. Everything in this
+-- buffer is keyed by Twitch id; sync.py translates to Postgres's own
+-- channels.id when it inserts. Replaces the old channel_cache table,
+-- which mixed Postgres ids and Twitch ids.
+DROP TABLE IF EXISTS channel_cache;
+CREATE TABLE IF NOT EXISTS twitch_channels (
+    name       TEXT PRIMARY KEY,
+    twitch_id  INTEGER NOT NULL UNIQUE
 );
 
 -- Small durable key/value store. Currently holds the Twitch OAuth
@@ -154,18 +157,19 @@ async def mark_channels_offline(conn: aiosqlite.Connection, live_channel_ids: li
 
 
 async def cache_channel_map(conn: aiosqlite.Connection, channel_id_map: dict[str, int]) -> None:
-    # OR REPLACE rather than ON CONFLICT(id): name is UNIQUE too, and a
-    # name moving to a different id must replace the old row, not raise.
+    """Stores name -> Twitch user id. OR REPLACE because both columns are
+    unique: a name moving to a different id must replace the old row."""
     await conn.executemany("""
-        INSERT OR REPLACE INTO channel_cache (id, name) VALUES (?, ?)
-    """, [(v, k) for k, v in channel_id_map.items()])
+        INSERT OR REPLACE INTO twitch_channels (name, twitch_id) VALUES (?, ?)
+    """, list(channel_id_map.items()))
     await conn.commit()
 
 
 async def load_cached_channel_map(conn: aiosqlite.Connection) -> dict[str, int]:
-    cursor = await conn.execute("SELECT id, name FROM channel_cache")
+    """Returns name -> Twitch user id."""
+    cursor = await conn.execute("SELECT name, twitch_id FROM twitch_channels")
     rows = await cursor.fetchall()
-    return {name: id_ for id_, name in rows}
+    return {name: twitch_id for name, twitch_id in rows}
 
 
 async def save_kv(conn: aiosqlite.Connection, key: str, value: str) -> None:
@@ -173,6 +177,16 @@ async def save_kv(conn: aiosqlite.Connection, key: str, value: str) -> None:
         INSERT INTO kv_state (key, value) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
     """, (key, value))
+    await conn.commit()
+
+
+async def save_kv_many(conn: aiosqlite.Connection, items: dict[str, str]) -> None:
+    if not items:
+        return
+    await conn.executemany("""
+        INSERT INTO kv_state (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, list(items.items()))
     await conn.commit()
 
 

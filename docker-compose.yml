@@ -35,6 +35,72 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  # Background data corrections in Postgres (see src/Sanitizer.py). Needs
+  # no local buffer, so it doesn't mount the chatbuffer volume.
+  sanitizer:
+    build: .
+    image: loganvelier/chatpipeline:latest
+    command: ["python", "src/Sanitizer.py"]
+    restart: always
+    env_file: .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Historical chat from logs.ivr.fi into the same buffer (see
+  # src/Backfill.py). Off unless BACKFILL_CHANNELS is set in .env.
+  backfill:
+    build: .
+    image: loganvelier/chatpipeline:latest
+    command: ["python", "src/Backfill.py"]
+    restart: always
+    env_file: .env
+    environment:
+      LOCAL_BUFFER_PATH: /data/buffer.db
+    volumes:
+      - chatbuffer:/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Daily reports (see src/Reporter.py): the daily_reports table, plus
+  # Markdown/HTML files in REPORTS_PATH (.env; default ./reports next to
+  # this file), e.g. a NAS share mounted on the host.
+  reporter:
+    build: .
+    image: loganvelier/chatpipeline:latest
+    command: ["python", "src/Reporter.py"]
+    restart: always
+    env_file: .env
+    volumes:
+      - ${REPORTS_PATH:-./reports}:/reports
+      # local backup used while REPORTS_PATH is unavailable (see .env.example)
+      - ${REPORTS_FALLBACK_PATH:-./reports-fallback}:/reports-fallback
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Serves REPORTS_PATH (index.html + each day's page) read-only on port 8090.
+  reports-web:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "8090:80"
+    volumes:
+      - ${REPORTS_PATH:-./reports}:/usr/share/nginx/html:ro
+
 volumes:
   # Shared between both services so they see the same SQLite buffer.
   # Named volume survives container restarts/rebuilds; the collector
