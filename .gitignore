@@ -233,5 +233,8 @@ logstream_fallback.log
 /.claude
 
 # Production data folder
-db/dump_prod.sh
 db/prod/*
+db/*.sh
+
+#.dump files
+*.dump

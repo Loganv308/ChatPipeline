@@ -265,12 +265,32 @@ async def load_context(pg: asyncpg.Pool) -> dict:
 
     # Per stream: [start, end] where it's known to have been live. end is
     # the send time of its last live-tagged message; now() if still live.
-    rows = await pg.fetch("""
-        SELECT s.id, s.channel_id, s.started_at, s.is_live,
-               (SELECT max(m.timestamp) FROM messages m WHERE m.stream_id = s.id) AS last_tagged
-        FROM streams s
-        WHERE s.started_at IS NOT NULL
+    # With idx_messages_stream_timestamp (built by setup()) each stream's
+    # last message is one index probe. Without it (e.g. a dry run, which
+    # builds nothing), per-stream lookups read every tagged message at
+    # random, so one sequential pass over the table is far faster.
+    has_index = await pg.fetchval("""
+        SELECT coalesce(bool_and(i.indisvalid), false) FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'idx_messages_stream_timestamp'
     """)
+    if has_index:
+        rows = await pg.fetch("""
+            SELECT s.id, s.channel_id, s.started_at, s.is_live,
+                   (SELECT max(m.timestamp) FROM messages m WHERE m.stream_id = s.id) AS last_tagged
+            FROM streams s
+            WHERE s.started_at IS NOT NULL
+        """)
+    else:
+        log.info("[Sweep] Finding each stream's last message with one pass over messages "
+                 "(no stream/timestamp index yet); this can take a few minutes on a large table.")
+        rows = await pg.fetch("""
+            SELECT s.id, s.channel_id, s.started_at, s.is_live, t.last_tagged
+            FROM streams s
+            LEFT JOIN (SELECT stream_id, max(timestamp) AS last_tagged
+                       FROM messages WHERE stream_id IS NOT NULL GROUP BY stream_id) t
+                   ON t.stream_id = s.id
+            WHERE s.started_at IS NOT NULL
+        """)
     now = datetime.now(timezone.utc)
     windows: dict[int, list] = {}
     for r in rows:
