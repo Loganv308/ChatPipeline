@@ -9,12 +9,18 @@ It sweeps the messages table in three phases, saving its position after
 every chunk (sanitizer_progress table) so a restart resumes rather than
 starting over:
 
-  rows         walk every message in primary-key order, applying ROW_FIXES
-  streams      walk every message with no stream_id, attributing it to the
-               stream that was live when it was sent. Runs after `rows`
-               so it sees repaired timestamps.
+  rows         walk every message inserted before the sweep started, in
+               insert order (created_at, message_id), applying ROW_FIXES
+  streams      walk them again, attributing each message with no stream_id
+               to the stream that was live when it was sent. Runs after
+               `rows` so it sees repaired timestamps.
   incremental  from then on, every SANITIZE_INTERVAL seconds, apply all
-               fixes to rows inserted since the last pass
+               fixes to rows inserted since the last pass (starting from
+               the sweep's start, so rows added during the sweep are covered)
+
+Insert order follows how rows sit on disk, so reads and writes stay
+mostly sequential; message_id order (random UUIDs) touched pages all over
+the table for every chunk.
 
 Every fix is idempotent and only writes rows whose values actually
 change. Chunks are short transactions with a pause between them, so the
@@ -46,10 +52,11 @@ log = LogStream(service="ChatPipeline-Sanitizer-Prod", host=os.getenv("LOG_HOST"
 
 SWEEP_VERSION     = 1       # bump when adding/changing a fix, to re-sweep every row
 SANITIZE_INTERVAL = 300     # seconds between incremental passes
-CHUNK_SIZE        = 5000    # rows read (and at most written) per transaction
-CHUNK_PAUSE       = 0.5     # seconds between chunks, to leave room for Sync
+CHUNK_SIZE        = 2000    # rows read (and at most written) per transaction
+CHUNK_PAUSE       = 0.2     # seconds between chunks, to leave room for Sync
 STATEMENT_TIMEOUT = "60s"   # per chunk transaction
-PROGRESS_EVERY    = 50      # chunks between progress log lines
+PROGRESS_EVERY    = 125     # chunks between progress log lines (~250k rows)
+SWEEP_FROM        = datetime(1, 1, 1, tzinfo=timezone.utc)  # cursor_created before the first row
 SHIFT_THRESHOLD   = timedelta(minutes=30)
 INCREMENTAL_OVERLAP = timedelta(minutes=2)  # re-checked at the start of each incremental pass
 DRY_RUN = os.getenv("SANITIZER_DRY_RUN", "").lower() in ("1", "true", "yes")
@@ -339,24 +346,29 @@ async def save_progress(conn, p: dict) -> None:
 # ─── Chunk processing ──────────────────────────────────────────────────────
 
 async def fetch_chunk(conn, p: dict) -> list:
-    if p["phase"] == "rows":
+    """The next CHUNK_SIZE rows in insert order (idx_messages_created_at_id).
+    The full-table phases stop at the sweep's start; later rows are the
+    incremental passes'. The streams phase reads every row too (its fix
+    leaves attributed rows alone): filtering on stream_id IS NULL could
+    scan far past a chunk's worth of rows to fill one."""
+    if "null_cursor" in p:
+        # rows with no created_at can't be reached by the keyset above
         return await conn.fetch(f"""
             SELECT {COLUMNS} FROM messages
-            WHERE $1::text IS NULL OR message_id > $1
+            WHERE created_at IS NULL AND message_id > $1
             ORDER BY message_id LIMIT {CHUNK_SIZE}
-        """, p["cursor_id"])
-    if p["phase"] == "streams":
-        # same key order, but only rows that could need a stream_id
+        """, p["null_cursor"])
+    if p["phase"] == "incremental":
         return await conn.fetch(f"""
             SELECT {COLUMNS} FROM messages
-            WHERE stream_id IS NULL AND ($1::text IS NULL OR message_id > $1)
-            ORDER BY message_id LIMIT {CHUNK_SIZE}
-        """, p["cursor_id"])
+            WHERE (created_at, message_id) > ($1, $2)
+            ORDER BY created_at, message_id LIMIT {CHUNK_SIZE}
+        """, p["cursor_created"], p["cursor_id"] or "")
     return await conn.fetch(f"""
         SELECT {COLUMNS} FROM messages
-        WHERE (created_at, message_id) > ($1, $2)
+        WHERE (created_at, message_id) > ($1, $2) AND created_at <= $3
         ORDER BY created_at, message_id LIMIT {CHUNK_SIZE}
-    """, p["cursor_created"], p["cursor_id"] or "")
+    """, p["cursor_created"], p["cursor_id"] or "", p["sweep_started"])
 
 
 def apply_fixes(rows: list, fixes: list, ctx: dict) -> tuple[list[dict], list[tuple], list[tuple]]:
@@ -452,10 +464,11 @@ async def run_chunk(pg: asyncpg.Pool, p: dict, ctx: dict, run: dict) -> int:
             counts[f"rejected_{column}"] = counts.get(f"rejected_{column}", 0) + 1
             log.error(f"[Guard] Refused {column} change on {message_id}: {old!r} -> {new!r}")
 
-        new_p = dict(p, rows_scanned=p["rows_scanned"] + len(rows),
-                     cursor_id=rows[-1]["message_id"], fixed=add_counts(p["fixed"], counts))
-        if p["phase"] == "incremental":
-            new_p["cursor_created"] = rows[-1]["created_at"]
+        new_p = dict(p, rows_scanned=p["rows_scanned"] + len(rows), fixed=add_counts(p["fixed"], counts))
+        if "null_cursor" in p:
+            new_p["null_cursor"] = rows[-1]["message_id"]  # in memory only; the saved cursor stays put
+        else:
+            new_p.update(cursor_created=rows[-1]["created_at"], cursor_id=rows[-1]["message_id"])
         new_run = dict(run, rows_scanned=run["rows_scanned"] + len(rows),
                        rows_changed=run["rows_changed"] + len(changed),
                        fixes=add_counts(run["fixes"], counts))
@@ -515,20 +528,35 @@ def fixed_summary(fixed: dict) -> str:
 async def walk_phase(pg: asyncpg.Pool, p: dict) -> None:
     """Runs the current full-table phase ('rows' or 'streams') to the end,
     as one audited run (or a new one per resume)."""
+    if p["cursor_created"] is None:
+        if p["cursor_id"] is not None:
+            # saved by a version that walked in message_id order: that
+            # position means nothing in insert order, so this phase starts
+            # over. Rows it already fixed are re-read but not rewritten.
+            log.info(f"[Sweep] Switching phase '{p['phase']}' to insert order; walking it again from the "
+                     f"start. Rows already fixed are only re-read.")
+        p.update(cursor_created=SWEEP_FROM, cursor_id="")
+    resuming = p["cursor_created"] > SWEEP_FROM
     estimate = await pg.fetchval("SELECT GREATEST(reltuples, 0)::bigint FROM pg_class WHERE relname = 'messages'")
     ctx = await load_context(pg)
     run = await start_run(pg, p["phase"])
     suffix = " (DRY RUN: nothing will be written)" if DRY_RUN else f" (run {run['id']})"
-    log.info(f"[Sweep] Phase '{p['phase']}' {'resuming' if p['cursor_id'] else 'starting'} "
-             f"over ~{estimate:,} rows{suffix}.")
+    log.info(f"[Sweep] Phase '{p['phase']}' {'resuming' if resuming else 'starting'} over ~{estimate:,} rows, "
+             f"inserted up to {p['sweep_started']:%Y-%m-%d %H:%M} UTC{suffix}.")
     chunks = 0
     try:
         while await run_chunk(pg, p, ctx, run):
             chunks += 1
             if chunks % PROGRESS_EVERY == 0:
-                log.info(f"[Sweep:{p['phase']}] ~{run['rows_scanned']:,} rows this run | "
-                         f"fixed: {fixed_summary(run['fixes'])}")
+                log.info(f"[Sweep:{p['phase']}] ~{run['rows_scanned']:,} rows this run, now at rows inserted "
+                         f"{p['cursor_created']:%Y-%m-%d %H:%M} UTC | fixed: {fixed_summary(run['fixes'])}")
             await asyncio.sleep(0 if DRY_RUN else CHUNK_PAUSE)
+        p["null_cursor"] = ""
+        try:
+            while await run_chunk(pg, p, ctx, run):
+                pass
+        finally:
+            del p["null_cursor"]
     except Exception as e:
         await finish_run(pg, run, "failed", str(e))
         raise
@@ -539,7 +567,7 @@ async def walk_phase(pg: asyncpg.Pool, p: dict) -> None:
 
 async def advance(pg: asyncpg.Pool, p: dict) -> None:
     if p["phase"] == "rows":
-        p.update(phase="streams", cursor_id=None)
+        p.update(phase="streams", cursor_id=None, cursor_created=None)
     elif p["phase"] == "streams":
         # Rows inserted during the sweep may have been passed already;
         # starting incremental from the sweep's start re-checks them.
@@ -557,8 +585,13 @@ async def incremental_pass(pg: asyncpg.Pool, p: dict) -> None:
         p.update(cursor_created=p["cursor_created"] - INCREMENTAL_OVERLAP, cursor_id=None)
     ctx = await load_context(pg)
     run = await start_run(pg, "incremental")
+    chunks = 0
     try:
         while await run_chunk(pg, p, ctx, run):
+            chunks += 1
+            if chunks % PROGRESS_EVERY == 0:  # only a big backlog, e.g. the first pass after the sweep
+                log.info(f"[Sweep:incremental] ~{run['rows_scanned']:,} rows so far, now at rows inserted "
+                         f"{p['cursor_created']:%Y-%m-%d %H:%M} UTC | fixed: {fixed_summary(run['fixes'])}")
             await asyncio.sleep(CHUNK_PAUSE)
     except Exception as e:
         await finish_run(pg, run, "failed", str(e))
@@ -575,6 +608,17 @@ async def main() -> None:
     pg = await connect_pg_with_retry(log)
     if not DRY_RUN:
         await setup(pg)
+    elif not await pg.fetchval("""
+            SELECT coalesce(bool_and(i.indisvalid), false) FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'idx_messages_created_at_id'
+    """):
+        # without it every chunk would sort the whole table
+        log.error("DRY RUN needs index idx_messages_created_at_id, which a dry run doesn't build. Create it with "
+                  "CREATE INDEX CONCURRENTLY idx_messages_created_at_id ON messages (created_at, message_id); "
+                  "(or start the sanitizer once normally), then dry-run again.")
+        await log.flush()
+        await pg.close()
+        return
 
     p = await load_progress(pg)
     log.info(f"Sanitizer started: sweep v{SWEEP_VERSION}, phase '{p['phase']}'.")
