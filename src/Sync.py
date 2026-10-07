@@ -66,16 +66,22 @@ async def sync_messages(db_conn, pg: asyncpg.Pool, limit: int = BATCH_SIZE) -> i
     if unmapped:
         names = sorted({r["channel"] for r, _ in unmapped})
         log.error(f"Dropping {len(unmapped)} message(s) for channels missing from Postgres: {names}")
-    await pg.executemany("""
+    # One statement for the whole batch (column arrays, unnested in order)
+    # rather than a row-by-row executemany: same rows, same conflict
+    # handling, far fewer round trips. It's atomic, and the buffer rows are
+    # only deleted once it has succeeded.
+    await pg.execute("""
         INSERT INTO messages
             (message_id, channel_id, channel_name, stream_id, user_id, username, message, timestamp, subscriber, is_bot)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        SELECT * FROM unnest($1::text[], $2::int[], $3::text[], $4::text[], $5::text[],
+                             $6::text[], $7::text[], $8::timestamptz[], $9::bool[], $10::bool[])
         ON CONFLICT (message_id) DO NOTHING
-    """, [
-        (r["message_id"], pg_id, r["channel"], r["stream_id"], r["user_id"], r["username"],
-         r["message"], parse_utc(r["timestamp"]), bool(r["subscriber"]), bool(r["is_bot"]))
-        for r, pg_id in mapped
-    ])
+    """,
+        [r["message_id"] for r, _ in mapped], [pg_id for _, pg_id in mapped],
+        [r["channel"] for r, _ in mapped], [r["stream_id"] for r, _ in mapped],
+        [r["user_id"] for r, _ in mapped], [r["username"] for r, _ in mapped],
+        [r["message"] for r, _ in mapped], [parse_utc(r["timestamp"]) for r, _ in mapped],
+        [bool(r["subscriber"]) for r, _ in mapped], [bool(r["is_bot"]) for r, _ in mapped])
     await store.delete_messages(db_conn, [r["id"] for r in rows])
     return len(mapped)
 
@@ -214,9 +220,14 @@ async def main() -> None:
     totals = {"messages": 0, "skipped": 0, "streams": 0}
     cycles = 0
 
+    backlog = False
     try:
         while True:
-            await asyncio.sleep(SYNC_INTERVAL)
+            # With a backlog (e.g. the historical backfill), go straight
+            # into the next pass rather than idling SYNC_INTERVAL between
+            # drains; channels and streams are still synced every pass.
+            if not backlog:
+                await asyncio.sleep(SYNC_INTERVAL)
 
             # channels, then streams, then messages: each carries a
             # foreign key to the one before, so the referenced row has to
@@ -232,6 +243,12 @@ async def main() -> None:
             totals["skipped"]  += n_skip
             totals["streams"]  += n_streams
             cycles += 1
+            # only while inserts are succeeding: if Postgres is down, n_msg
+            # is 0 and the pass waits SYNC_INTERVAL as usual
+            try:
+                backlog = n_msg > 0 and (await store.count_pending(db_conn))["messages"] >= DRAIN_BATCH_SIZE
+            except Exception:
+                backlog = False
 
             if cycles % STATS_EVERY_N_CYCLES == 0:
                 try:
